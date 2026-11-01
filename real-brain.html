@@ -925,7 +925,7 @@ function useLive(sock){
   mode = "live"; ws = sock; nextBarTime = null;
   btnSource.textContent = "⏺ Use recorded"; btnSource.disabled = false;
   if(!cloudReady){
-    fetch("/neuron_cloud.json").then(r=>r.json()).then(cloud=> ensureCloud(cloud, null)).catch(()=>{});
+    fetch(LIVE_HTTP + "/neuron_cloud.json").then(r=>r.json()).then(cloud=> ensureCloud(cloud, null)).catch(()=>{});
   }
 }
 
@@ -979,18 +979,27 @@ function useRecorded(reason){
   });
 }
 
+// Live-first: when this page is served by something other than the live
+// server itself (e.g. `py -m http.server 8000`), look for the live server on
+// port 4670 of the same machine rather than giving up and replaying the
+// recorded export.  LIVE_HTTP is also where /neuron_cloud.json is fetched from.
+const LIVE_PORT = 4670;
+const onLiveServer = String(location.port) === String(LIVE_PORT);
+const LIVE_HTTP = onLiveServer ? "" : ("http://" + (location.hostname || "localhost") + ":" + LIVE_PORT);
 function tryLive(onFail){
   const proto = location.protocol==="https:" ? "wss://" : "ws://";
   let settled = false, sock;
-  try { sock = new WebSocket(proto + location.host + "/ws"); }
+  const wsUrl = onLiveServer ? (proto + location.host + "/ws")
+                             : ("ws://" + (location.hostname || "localhost") + ":" + LIVE_PORT + "/ws");
+  try { sock = new WebSocket(wsUrl); }
   catch(e){ onFail(); return; }
-  const timer = setTimeout(()=>{ if(!settled){ settled=true; try{ sock.close(); }catch(e){} onFail(); } }, 1500);
+  const timer = setTimeout(()=>{ if(!settled){ settled=true; try{ sock.close(); }catch(e){} onFail(); } }, 6000);
   sock.onmessage = (ev)=>{
     if(!settled){
       settled = true; clearTimeout(timer);
       useLive(sock);
       sock.onerror = ()=>{ if(mode==="live") setStatus("disconnected",""); };
-      sock.onclose = ()=>{ if(mode==="live") setStatus("disconnected",""); };
+      sock.onclose = ()=>{ if(mode==="live"){ setStatus("disconnected",""); useRecorded("recorded FALLBACK (live server connection lost; retrying live)"); } };
     }
     handleLiveMessage(ev);
   };
@@ -1000,11 +1009,18 @@ function tryLive(onFail){
 
 tryLive(()=>useRecorded("recorded run (no live server found)"));
 
+let manualRecorded = false;
+// Live is the default: if we are on the recorded fallback only because the
+// server was unreachable, keep trying to get back onto the live stream.
+setInterval(()=>{ if(mode==="recorded" && !manualRecorded && !retrying){ retrying=true; tryLive(()=>{ retrying=false; }); } }, 8000);
+let retrying = false;
 btnSource.addEventListener("click", ()=>{
   if(mode==="live"){
+    manualRecorded = true;
     if(ws){ ws.onmessage=null; ws.onerror=null; ws.onclose=null; try{ ws.close(); }catch(e){} ws=null; }
     useRecorded("recorded run (switched manually)");
   } else {
+    manualRecorded = false;
     btnSource.disabled = true; btnSource.textContent = "checking …";
     tryLive(()=>{ btnSource.textContent = "▶ Try live"; btnSource.disabled = false; loadStatus.textContent = "still no live server found — staying on the recorded run."; });
   }

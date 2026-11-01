@@ -39,7 +39,6 @@ class LiveParams(Params):
 
 app = FastAPI()
 state = {}
-_conn_id = {"current": 0}  # only the most recently connected client drives the (single, shared) brain
 
 
 def setup():
@@ -103,7 +102,102 @@ def run_bar(seed_base):
     return norm
 
 
-ALLOWED_ORIGINS = {"http://localhost:4670", "http://127.0.0.1:4670", "http://[::1]:4670"}
+ALLOWED_ORIGINS = {f"http://{h}:{p}" for h in ("localhost", "127.0.0.1", "[::1]")
+                   for p in (4670, 8000)}
+
+# One shared brain, many listeners.  The first version of this server ran a
+# fresh brain per websocket and let a newer client supersede an older one, so
+# opening the viewer page silently killed fly-band's live drum feed (and the
+# brain sat idle whenever nobody was connected).  Now a single background task
+# trains once and then streams bars forever; every client just subscribes and
+# is caught up with the meta, the training history and the latest bar.
+CLIENTS = set()
+HISTORY = {"meta": None, "training": [], "bar": None}
+PROGRESS = {"phase": "loading", "bar": -1, "gen": 0, "t": 0.0}
+
+
+async def broadcast(msg):
+    dead = []
+    for ws in list(CLIENTS):
+        try:
+            await ws.send_json(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        CLIENTS.discard(ws)
+
+
+async def produce():
+    import time
+    fb, mb = state["fb"], state["mb"]
+    loop = asyncio.get_event_loop()
+    HISTORY["meta"] = {
+        "type": "meta", "neurons": int(fb.n), "edges": int(fb.W.nnz),
+        "channel_subclass": CHANNEL_SUBCLASS, "dt_ms": fb.p.dt, "drive_hz": DRIVE_HZ,
+        "device": str(fb.device),
+    }
+    PROGRESS["phase"] = "training"
+    for gen in range(TRAIN_GENERATIONS):
+        norm = await loop.run_in_executor(None, run_bar, gen)
+        fit = fitness(norm, state["target"])
+        mb.dopamine(+1, amount=fit / 100.0)
+        mb.apply()
+        msg = {
+            "type": "training", "gen": gen + 1, "total": TRAIN_GENERATIONS,
+            "fitness": fit, "depressed": mb.stats()["depressed"], "synapses": mb.stats()["synapses"],
+        }
+        HISTORY["training"].append(msg)
+        PROGRESS.update(gen=gen + 1, t=time.time())
+        await broadcast(msg)
+
+    PROGRESS["phase"] = "performing"
+    bar_i = 0
+    while True:
+        section = SECTIONS[bar_i % len(SECTIONS)]
+        t0 = loop.time()
+        norm = await loop.run_in_executor(None, run_bar, 1000 + bar_i)
+        compute_s = loop.time() - t0
+        density = {"intro": 0.6, "outro": 0.5}.get(section, 1.0)
+        hits = []
+        for step in range(STEPS_PER_BAR):
+            for ch in CHANNEL_SUBCLASS:
+                p = norm[ch][step] * density
+                if p > 0.55:
+                    hits.append({"step": step, "ch": ch, "vel": round(min(1.0, 0.4 + p * 0.7), 3)})
+        msg = {
+            "type": "bar", "bar": bar_i, "section": section, "bpm": 100,
+            "hits": hits, "compute_s": round(compute_s, 3),
+        }
+        HISTORY["bar"] = msg
+        PROGRESS.update(bar=bar_i, t=time.time())
+        await broadcast(msg)
+        bar_i += 1
+
+
+@app.get("/state")
+async def live_state():
+    """Liveness probe: bar counter and wall-clock age of the newest bar."""
+    import time
+    return JSONResponse({
+        "phase": PROGRESS["phase"], "bar": PROGRESS["bar"], "gen": PROGRESS["gen"],
+        "seconds_since_update": round(time.time() - PROGRESS["t"], 2) if PROGRESS["t"] else None,
+        "clients": len(CLIENTS), "device": str(state["fb"].device),
+        "last_bar": HISTORY["bar"],
+    })
+
+
+@app.on_event("startup")
+async def begin():
+    async def forever():
+        while True:
+            try:
+                await produce()
+            except Exception as exc:
+                import traceback
+                print("drum brain run ended:", str(exc)[:160])
+                traceback.print_exc()
+                await asyncio.sleep(6)
+    asyncio.create_task(forever())
 
 
 @app.websocket("/ws")
@@ -111,69 +205,32 @@ async def ws_endpoint(websocket: WebSocket):
     # cross-site WebSocket hijacking guard: this stream has no auth, so any
     # page in the browser could otherwise open it and read the live brain
     # data. A browser always sends Origin on a WebSocket handshake; a
-    # same-machine, non-browser client (curl, a test) sends none and is let
-    # through, since it isn't the cross-site case this is guarding against.
+    # same-machine, non-browser client (curl, a test, fly-band) sends none
+    # and is let through, since it isn't the cross-site case this guards.
     origin = websocket.headers.get("origin")
     if origin is not None and origin not in ALLOWED_ORIGINS:
         await websocket.close(code=1008)
         return
     await websocket.accept()
-    _conn_id["current"] += 1
-    my_id = _conn_id["current"]  # a newer tab connecting supersedes this one — see checks below
-    fb, mb = state["fb"], state["mb"]
-    loop = asyncio.get_event_loop()
-
-    def mine():
-        return _conn_id["current"] == my_id
-
+    CLIENTS.add(websocket)
     try:
-        await websocket.send_json({
-            "type": "meta", "neurons": int(fb.n), "edges": int(fb.W.nnz),
-            "channel_subclass": CHANNEL_SUBCLASS, "dt_ms": fb.p.dt, "drive_hz": DRIVE_HZ,
-            "device": str(fb.device),
-        })
-
-        for gen in range(TRAIN_GENERATIONS):
-            if not mine():
-                return
-            norm = await loop.run_in_executor(None, run_bar, gen)
-            if not mine():
-                return
-            fit = fitness(norm, state["target"])
-            mb.dopamine(+1, amount=fit / 100.0)
-            mb.apply()
-            await websocket.send_json({
-                "type": "training", "gen": gen + 1, "total": TRAIN_GENERATIONS,
-                "fitness": fit, "depressed": mb.stats()["depressed"], "synapses": mb.stats()["synapses"],
-            })
-
-        bar_i = 0
+        # wait for the first thing worth sending, then catch the client up
+        while HISTORY["meta"] is None:
+            await asyncio.sleep(0.1)
+        await websocket.send_json(HISTORY["meta"])
+        for m in list(HISTORY["training"]):
+            await websocket.send_json(m)
+        if HISTORY["bar"] is not None:
+            await websocket.send_json(HISTORY["bar"])
         while True:
-            if not mine():
-                return
-            section = SECTIONS[bar_i % len(SECTIONS)]
-            t0 = loop.time()
-            norm = await loop.run_in_executor(None, run_bar, 1000 + bar_i)
-            compute_s = loop.time() - t0
-            if not mine():
-                return
-            density = {"intro": 0.6, "outro": 0.5}.get(section, 1.0)
-            hits = []
-            for step in range(STEPS_PER_BAR):
-                for ch in CHANNEL_SUBCLASS:
-                    p = norm[ch][step] * density
-                    if p > 0.55:
-                        hits.append({"step": step, "ch": ch, "vel": round(min(1.0, 0.4 + p * 0.7), 3)})
-            await websocket.send_json({
-                "type": "bar", "bar": bar_i, "section": section, "bpm": 100,
-                "hits": hits, "compute_s": round(compute_s, 3),
-            })
-            bar_i += 1
-    except WebSocketDisconnect:
+            await websocket.receive_text()
+    except Exception:
         pass
+    finally:
+        CLIENTS.discard(websocket)
 
 
 if __name__ == "__main__":
     setup()
     print("open http://localhost:4670")
-    uvicorn.run(app, host="0.0.0.0", port=4670)
+    uvicorn.run(app, host="0.0.0.0", port=4670, log_level="warning")
