@@ -18,6 +18,12 @@ acoustic-kit performances from MDBDrums when you have a local checkout of it
 plotted at its real measured position on the left, a fly performing on a kit
 on the right, synthesized in the browser with the Web Audio API.
 
+## Screenshots
+
+![The drum fly: the live connectome viewer, "training live · gen 6/6" on the GPU, kit and performer on the right.](docs/drums.png)
+
+*The drum fly: the live connectome viewer, "training live · gen 6/6" on the GPU, kit and performer on the right.*
+
 ## Two ways to hear it
 
 | | requires | what it does |
